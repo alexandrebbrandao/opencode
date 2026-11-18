@@ -47,7 +47,7 @@ const withCamera = (target: ServerConnectTarget) =>
     available: true,
   }).state
 
-const field = (name: "link" | "url" | "name" | "password", value: string): ServerConnectEvent => ({
+const field = (name: "link" | "url" | "name" | "username" | "password" | "account", value: string): ServerConnectEvent => ({
   type: "field.changed",
   field: name,
   value,
@@ -56,6 +56,16 @@ const field = (name: "link" | "url" | "name" | "password", value: string): Serve
 const password: ServerConnectEvent = { type: "method.changed", method: "password" }
 
 const submitted: ServerConnectEvent = { type: "submitted" }
+
+const credentials = (methods: ("password" | "local")[]): ServerConnectEvent => ({
+  type: "submit.failed",
+  attempt: 1,
+  error: { type: "credentials", methods },
+})
+
+/** The form after the server's 401 advertised only its local accounts. */
+const localForm = () =>
+  replay({ kind: "add" }, [password, field("url", "new:4096"), submitted, credentials(["local"])]).state
 
 const succeeded = (attempt: number, url: string, secret?: string): ServerConnectEvent => ({
   type: "submit.succeeded",
@@ -445,10 +455,209 @@ describe("server connect form", () => {
       link: "",
       url: "http://old:4096",
       name: "Remote",
+      username: "",
       password: "secret",
+      account: "signin",
     })
     expect(view(edit({ unauthorized: true })).draft.method).toBe("link")
     expect(view({ kind: "connect", url: "http://localhost:4096" }).draft.url).toBe("http://localhost:4096")
+  })
+
+  test("a connect screen whose health already advertised local-only accounts opens on the account form", () => {
+    const view = (target: ServerConnectTarget) => selectServerConnectView(startServerConnect(target).state, context)
+
+    const local = view({ kind: "connect", url: "http://localhost:4096", methods: ["local"] })
+
+    expect(local.draft).toEqual({
+      method: "password",
+      link: "",
+      url: "http://localhost:4096",
+      name: "",
+      username: "",
+      password: "",
+      account: "signin",
+    })
+    expect(local.localAuth).toBe(true)
+    // The served screen is then just a sign-in: no address field and no pairing link.
+    expect(local.direct).toBe(true)
+    expect(local.canSubmit).toBe(false)
+
+    const result = replay({ kind: "connect", url: "http://localhost:4096", methods: ["local"] }, [
+      field("username", "user"),
+      field("password", "secret"),
+      submitted,
+    ])
+
+    expect(result.effects[0]).toMatchObject({
+      type: "connect.local",
+      url: "http://localhost:4096",
+      username: "user",
+      password: "secret",
+      create: false,
+    })
+
+    // Servers that also take the shared password keep the pairing-link start: their methods say the form is not the
+    // only way in.
+    expect(view({ kind: "connect", url: "http://localhost:4096", methods: ["password"] }).draft.method).toBe("link")
+    expect(view({ kind: "connect", url: "http://localhost:4096", methods: ["password", "local"] }).draft.method).toBe("link")
+    expect(view({ kind: "connect", url: "http://localhost:4096", methods: ["password"] }).direct).toBe(false)
+    expect(view({ kind: "connect", url: "http://localhost:4096", methods: ["password", "local"] }).direct).toBe(false)
+
+    // The add and edit dialogs keep their full form: they name a server the page does not host.
+    expect(view(edit({ password: "secret" })).direct).toBe(false)
+  })
+
+  test("a local-only server switches the shared-password form to its account form", () => {
+    const result = replay({ kind: "add" }, [password, field("url", "new:4096"), submitted, credentials(["local"])])
+
+    expect(result.state).toMatchObject({
+      status: "editing",
+      draft: { url: "new:4096", username: "", password: "", account: "signin" },
+    })
+    expect(result.effects.at(-1)).toEqual({ type: "timer.stop" })
+
+    const view = selectServerConnectView(result.state, context)
+
+    expect(view.error).toBeUndefined()
+    expect(view.localAuth).toBe(true)
+    expect(view.creating).toBe(false)
+    expect(view.canSubmit).toBe(false)
+  })
+
+  test("a password server keeps the password form on rejected credentials", () => {
+    const result = replay(edit({ password: "secret" }), [
+      field("password", "wrong"),
+      submitted,
+      credentials(["password"]),
+    ])
+
+    expect(result.state).toMatchObject({ status: "editing", error: { type: "credentials" } })
+    expect(selectServerConnectView(result.state, context).localAuth).toBe(false)
+  })
+
+  test("an account sign-in submits its credentials and saves the session", () => {
+    const result = replay({ kind: "add" }, [field("username", "ada"), field("password", "s3cure"), submitted], localForm())
+
+    expect(result.effects[0]).toEqual({
+      type: "connect.local",
+      attempt: 2,
+      url: "http://new:4096",
+      username: "ada",
+      password: "s3cure",
+      create: false,
+    })
+    expect(result.effects.at(-1)).toEqual({ type: "timer.start", attempt: 2, timeoutMs: SERVER_CONNECT_TIMEOUT_MS })
+
+    const saved = transitionServerConnect(result.state, succeeded(2, "http://new:4096", "v2.sess_x"))
+    const connection = {
+      type: "http",
+      displayName: undefined,
+      http: { url: "http://new:4096", password: "v2.sess_x" },
+    } as const
+
+    expect(saved.state.status).toBe("closed")
+    expect(saved.effects.slice(-2)).toEqual([
+      { type: "save", action: { type: "add", connection } },
+      { type: "close", saved: connection },
+    ])
+  })
+
+  test("an account can register instead", () => {
+    const result = replay(
+      { kind: "add" },
+      [field("account", "create"), field("username", "ada"), field("password", "s3cure"), submitted],
+      localForm(),
+    )
+
+    expect(result.effects[0]).toMatchObject({ type: "connect.local", create: true })
+    expect(selectServerConnectView(result.state, context).creating).toBe(true)
+  })
+
+  test("a rejected sign-in keeps the account form and its values", () => {
+    const result = replay(
+      { kind: "add" },
+      [
+        field("username", "ada"),
+        field("password", "s3cure"),
+        submitted,
+        { type: "submit.failed", attempt: 2, error: { type: "credentials", methods: ["local"] } },
+      ],
+      localForm(),
+    )
+
+    expect(result.state).toMatchObject({
+      status: "editing",
+      error: { type: "credentials" },
+      draft: { username: "ada", password: "s3cure" },
+    })
+    expect(selectServerConnectView(result.state, context).error).toBe("server.connect.local.invalid")
+  })
+
+  test("a 401 that announces nothing keeps the learned account form", () => {
+    const result = replay(
+      { kind: "add" },
+      [
+        field("username", "ada"),
+        field("password", "s3cure"),
+        submitted,
+        { type: "submit.failed", attempt: 2, error: { type: "credentials", methods: [] } },
+      ],
+      localForm(),
+    )
+
+    expect(result.state).toMatchObject({
+      status: "editing",
+      draft: { username: "ada", password: "s3cure" },
+    })
+    expect(selectServerConnectView(result.state, context).localAuth).toBe(true)
+  })
+
+  test("a taken username and a refused account request report the server", () => {
+    const taken = replay(
+      { kind: "add" },
+      [
+        field("username", "ada"),
+        field("password", "s3cure"),
+        submitted,
+        { type: "submit.failed", attempt: 2, error: { type: "username-taken" } },
+      ],
+      localForm(),
+    )
+    expect(selectServerConnectView(taken.state, context).error).toBe("server.connect.local.taken")
+
+    const refused = replay(
+      { kind: "add" },
+      [
+        field("username", "ada"),
+        field("password", "short"),
+        submitted,
+        { type: "submit.failed", attempt: 2, error: { type: "refused", message: "Password must be longer." } },
+      ],
+      localForm(),
+    )
+    expect(selectServerConnectView(refused.state, context).error).toBe("Password must be longer.")
+  })
+
+  test("switching to a pairing link and back keeps the account form", () => {
+    const result = replay(
+      { kind: "add" },
+      [
+        { type: "method.changed", method: "link" },
+        { type: "method.changed", method: "password" },
+      ],
+      localForm(),
+    )
+
+    expect(selectServerConnectView(result.state, context).localAuth).toBe(true)
+  })
+
+  test("rejected credentials blame the password, or the account it belongs to", () => {
+    expect(formatServerConnectError({ type: "credentials", methods: ["password"] }, context)).toBe(
+      "dialog.server.add.error",
+    )
+    expect(
+      formatServerConnectError({ type: "credentials", methods: ["local"] }, { ...context, localAuth: true }),
+    ).toBe("server.connect.local.invalid")
   })
 
   test.each([
